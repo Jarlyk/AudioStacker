@@ -142,6 +142,7 @@ void ext_main(void* r) {
 	class_addmethod(c, (method)jbox_notify, "notify", A_CANT, 0);
 
 	CLASS_ATTR_INT32(c, "active", 0, t_stackscope, a_active);
+	CLASS_ATTR_STYLE(c, "active", 0, "onoff");
 	CLASS_ATTR_RGBA(c, "bgcolor", 0, t_stackscope, a_bgcolor);
 	CLASS_ATTR_STYLE_LABEL(c, "bgcolor", 0, "rgba", "Background Color");
 	CLASS_ATTR_RGBA(c, "sig1color", 0, t_stackscope, a_sig1color);
@@ -154,8 +155,8 @@ void ext_main(void* r) {
 	CLASS_ATTR_FILTER_MIN(c, "samples", 0);
 	CLASS_ATTR_DOUBLE(c, "range", 0, t_stackscope, a_range);
 	CLASS_ATTR_DOUBLE(c, "ceiling", 0, t_stackscope, a_ceiling);
-	CLASS_ATTR_DOUBLE(c, "presamples", 0, t_stackscope, a_pending_presamples);
-	CLASS_ATTR_DOUBLE(c, "lookaheadsamples", 0, t_stackscope, a_lookaheadsamples);
+	CLASS_ATTR_INT32(c, "presamples", 0, t_stackscope, a_pending_presamples);
+	CLASS_ATTR_INT32(c, "lookaheadsamples", 0, t_stackscope, a_lookaheadsamples);
 
 	CLASS_ATTR_SYM(c, "channel", 0, t_stackscope, a_channel);
 	CLASS_ATTR_ENUM(c, "channel", 0, "mono left right max");
@@ -200,22 +201,23 @@ void stackscope_perform64(t_stackscope* x, t_object* dsp64, double** ins, long n
 
 	while (search_idx < sampleframes) {
 		if (x->a_is_sampling) {
+			int nsig = x->a_samples + x->a_presamples;
 			int new_index = x->a_sig_index + (sampleframes - samp_idx);
-			if (new_index >= x->a_samples) {
-				int n = x->a_samples - x->a_sig_index;
+			if (new_index >= nsig) {
+				int n = nsig - x->a_sig_index;
 				size_t size = n*sizeof(double);
 				memcpy(&x->a_sig1_left[x->a_sig_index], &sig1_l[samp_idx], size);
 				memcpy(&x->a_sig1_right[x->a_sig_index], &sig1_r[samp_idx], size);
 				memcpy(&x->a_sig2_left[x->a_sig_index], &sig2_l[samp_idx], size);
 				memcpy(&x->a_sig2_right[x->a_sig_index], &sig2_r[samp_idx], size);
-				x->a_sig_index = x->a_samples;
+				x->a_sig_index = nsig;
 				x->a_is_sampling = false;
 				search_idx = samp_idx + n;
 
-				//Report peaks and snap completion
+				//Report peaks and snap completion (peaks only in samples region)
 				double peak_left_s = 0;
 				double peak_right_s = 0;
-				for (int i=0; i < x->a_samples; i++) {
+				for (int i=x->a_presamples; i < nsig; i++) {
 					peak_left_s = max(peak_left_s, fabs(x->a_sig1_left[i] + x->a_sig2_left[i]));
 					peak_right_s = max(peak_right_s, fabs(x->a_sig1_right[i] + x->a_sig2_right[i]));
 				}
@@ -245,7 +247,7 @@ void stackscope_perform64(t_stackscope* x, t_object* dsp64, double** ins, long n
 					
 					//Allocate buffers if needed (such as if requested sample count has changed)
 					int samples = x->a_pending_samples;
-					int presamples = min(max(x->a_pending_presamples, hist_max), HIST_SIZE);
+					int presamples = min(max(x->a_pending_presamples, 0), hist_max);
 					if (samples > 0 && (x->a_samples != samples || x->a_presamples != presamples || x->a_sig1_left == NULL))
 					{
 						x->a_samples = samples;
@@ -338,7 +340,7 @@ void stackscope_paint(t_stackscope* x, t_object* view) {
 	
 	if (x->a_sizex <= 0 || x->a_sizey <= 0 || x->a_img_chart_ds == NULL) return;
 	
-	//Draw chart image
+	//Draw chart image (1/2x downsampled size due to 2x AA)
 	t_jsurface* surf = jgraphics_image_surface_create_for_data(x->a_img_chart_ds, 
 		JGRAPHICS_FORMAT_ARGB32,
 		x->a_sizex/2,
@@ -361,6 +363,14 @@ void draw_full_column(int sizey, int stride, t_uint8* bufIter, t_uint8 b, t_uint
 		bufIter[3] = a;
 		bufIter += stride;
 	}
+}
+
+void draw_full_column_c(int sizey, int stride, t_uint8* bufIter, t_jrgba c) {
+	t_uint8 b = (t_uint8)floor(255*c.blue);
+	t_uint8 g = (t_uint8)floor(255*c.green);
+	t_uint8 r = (t_uint8)floor(255*c.red);
+	t_uint8 a = (t_uint8)floor(255*c.alpha);
+	draw_full_column(sizey, stride, bufIter, b, g, r, a);
 }
 
 typedef double (*f_get_channel)(double, double);
@@ -411,7 +421,7 @@ void update_img_chart(t_stackscope* scope, int sizex, int sizey) {
 
 	//Create some local helper variables to keep things concise
 	t_uint8* buf = scope->a_img_chart;
-	int nsig = scope->a_samples;
+	int nsig = scope->a_presamples + scope->a_samples;
 	int sic = scope->a_sig_index;
 	double* s1l = scope->a_sig1_left;
 	double* s1r = scope->a_sig1_right;
@@ -431,17 +441,26 @@ void update_img_chart(t_stackscope* scope, int sizex, int sizey) {
 	double ext2_prior = 0;
 	double extsum_prior = 0;
 	for (int x=0; x <= lastx; x++) {
-		
-		//Start by marking all pixels in the column as transparent
-		t_uint8* bufIter = buf + 4*x;
-		draw_full_column(sizey, stride, bufIter, 0, 0, 0, 0);
-		
 		//Get first and last sample index for this column's bin
 		int si0 = x*(nsig-1)/(sizex-1);
 		int si1 = (x+1)*(nsig-1)/(sizex-1) - 1;
 		if (si1 < si0) si1 = si0 + 1;
-		if (si1 >= nsig) si1 = nsig - 1;		
+		if (si1 >= nsig) si1 = nsig - 1;
 
+		//Start by clearing all pixels in the column
+		//If we're in the presample or lookahead region, we use a background color instead of transparent
+		t_uint8* bufIter = buf + 4*x;
+		int sia = (si1 + si0)/2;
+		if (sia <= scope->a_presamples) {
+			draw_full_column_c(sizey, stride, bufIter, scope->a_presamplebgcolor);			
+		}
+		else if (sia <= scope->a_presamples + scope->a_lookaheadsamples) {
+			draw_full_column_c(sizey, stride, bufIter, scope->a_lookaheadbgcolor);
+		}
+		else {
+			draw_full_column(sizey, stride, bufIter, 0, 0, 0, 0);			
+		}
+		
 		//Get min/max values for this bin (TODO: support other downsampling methods)
 		double min1 = DBL_MAX;
 		double max1 = DBL_MIN;
@@ -507,7 +526,6 @@ void update_img_chart(t_stackscope* scope, int sizex, int sizey) {
 }
 
 void draw_pixel(t_uint8* bufIter, t_jrgba c) {
-	//Compute color from interpolating along gradient
 	bufIter[0] = (t_uint8)floor(255*c.blue);
 	bufIter[1] = (t_uint8)floor(255*c.green);
 	bufIter[2] = (t_uint8)floor(255*c.red);
@@ -656,6 +674,8 @@ void* stackscope_new(t_symbol* s, long argc, t_atom* argv) {
 		jrgba_set(&x->a_sig1color, 0, 0.3, 1, 1);
 		jrgba_set(&x->a_sigsumcolor, 0 ,1, 0, 1);
 		jrgba_set(&x->a_aboveceilcolor, 1, 0, 0, 1);
+		jrgba_set(&x->a_lookaheadbgcolor, 0.22, 0.4, 0.66, 0.5);
+		jrgba_set(&x->a_presamplebgcolor, 0.3, 0.3, 0.3, 0.5);
 		x->a_active = 1;
 		x->a_range = 1;
 		x->a_ceiling = 0;
@@ -675,6 +695,9 @@ void* stackscope_new(t_symbol* s, long argc, t_atom* argv) {
 		x->a_hist2_left = (double*)sysmem_newptrclear(HIST_SIZE*sizeof(double));
 		x->a_hist2_right = (double*)sysmem_newptrclear(HIST_SIZE*sizeof(double));
 		x->a_hist_rec_index = 0;
+		x->a_presamples = 0;
+		x->a_pending_presamples = 0;
+		x->a_lookaheadsamples = 0;
 		
 		x->a_obj.z_box.b_firstin = (void*)x;
 		dsp_setupjbox((t_pxjbox*)x, 5);
